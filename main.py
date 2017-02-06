@@ -81,75 +81,77 @@ class DNC(Chain):
 
     def __call__(self, x):
         # <question : is batchsize>1 possible for RNN ? if No, I will implement calculations without batch dimension.>
-        self.chi = F.concat((x, self.r))
-        (self.nu, self.xi) = \
-            F.split_axis(self.l_dl(self.chi), [self.Y], 1)
-        (self.kr, self.betar, self.kw, self.betaw,
-         self.e, self.v, self.f, self.ga, self.gw, self.pi
-         ) = F.split_axis(self.xi, np.cumsum(
-             [self.W * self.R, self.R, self.W, 1, self.W, self.W, self.R, 1, 1]), 1)
+        chi = F.concat((x, self.r))
+        ctrl_out = self.l_dl(chi)
+        nu, xi = ctrl_out[:, :self.Y], ctrl_out[:, self.Y:]
 
-        self.kr = F.reshape(self.kr, (self.R, self.W))  # R * W
-        self.betar = 1 + F.softplus(self.betar)  # 1 * R
+        xi_indices = np.cumsum([self.W * self.R,
+                                self.R,
+                                self.W,
+                                1,
+                                self.W,
+                                self.W,
+                                self.R,
+                                1,
+                                1])
+
+        kr, betar, kw, betaw, e, v, f, ga, gw, pi = F.split_axis(xi, xi_indices, 1)
+
+        kr = kr.reshape(self.R, self.W) # R * W
+        betar = 1 + F.softplus(betar)  # 1 * R
         # self.kw: 1 * W
-        self.betaw = 1 + F.softplus(self.betaw)  # 1 * 1
-        self.e = F.sigmoid(self.e)  # 1 * W
+        betaw = 1 + F.softplus(betaw)  # 1 * 1
+        e = F.sigmoid(e)  # 1 * W
         # self.v : 1 * W
-        self.f = F.sigmoid(self.f)  # 1 * R
-        self.ga = F.sigmoid(self.ga)  # 1 * 1
-        self.gw = F.sigmoid(self.gw)  # 1 * 1
-        self.pi = F.softmax(F.reshape(self.pi, (self.R, 3))
-                            )  # R * 3 (softmax for 3)
+        f = F.sigmoid(f)  # 1 * R
+        ga = F.sigmoid(ga)  # 1 * 1
+        gw = F.sigmoid(gw)  # 1 * 1
+        pi = F.softmax(pi.reshape(self.R, 3)) # R * 3 (softmax for 3)
 
         # self.wr : N * R
-        self.psi_mat = 1 - \
-            F.matmul(Variable(np.ones((self.N, 1)).astype(
-                np.float32)), self.f) * self.wr  # N * R
-        self.psi = Variable(np.ones((self.N, 1)).astype(np.float32))  # N * 1
+        n_ones = np.ones((self.N, 1), np.float32)
+        self.psi_mat = 1 - (n_ones @ f) * self.wr  # N * R
+        self.psi = Variable(n_ones)  # N * 1
         for i in range(self.R):
-            self.psi = self.psi * \
-                F.reshape(self.psi_mat[:, i], (self.N, 1))  # N * 1
+            self.psi = self.psi * self.psi_mat[:, i:i+1]
 
         # self.ww, self.u : N * 1
         self.u = (self.u + self.ww - (self.u * self.ww)) * self.psi
 
         self.a = u2a(self.u)  # N * 1
-        self.cw = C(self.M, self.kw, self.betaw)  # N * 1
-        self.ww = F.matmul(F.matmul(self.a, self.ga) +
-                           F.matmul(self.cw, 1.0 - self.ga), self.gw)  # N * 1
-        self.M = self.M * (np.ones((self.N, self.W)).astype(np.float32) -
-                           F.matmul(self.ww, self.e)) + F.matmul(self.ww, self.v)  # N * W
+        cw = C(self.M, kw, betaw)  # N * 1
+        self.ww = (self.a @ ga + cw @ (1.0 - ga)) @ gw
+        self.M = self.M * (1 - self.ww @ e) + self.ww @ v
 
-        self.p = (1.0 - F.matmul(Variable(np.ones((self.N, 1)).astype(np.float32)), F.reshape(F.sum(self.ww), (1, 1)))) \
-            * self.p + self.ww  # N * 1
-        self.wwrep = F.matmul(self.ww, Variable(
-            np.ones((1, self.N)).astype(np.float32)))  # N * N
-        self.L = (1.0 - self.wwrep - F.transpose(self.wwrep)) * \
-            self.L + F.matmul(self.ww, F.transpose(self.p))  # N * N
-        self.L = self.L * (np.ones((self.N, self.N)) -
-                           np.eye(self.N))  # force L[i,i] == 0
+        self.p = (1.0 - n_ones @ F.sum(self.ww).reshape(1, 1)) * self.p + self.ww
 
-        self.fo = F.matmul(self.L, self.wr)  # N * R
-        self.ba = F.matmul(F.transpose(self.L), self.wr)  # N * R
+        wwrep = self.ww @ np.ones((1, self.N), np.float32) 
+        self.L = (1.0 - wwrep - F.transpose(self.wwrep)) * self.L + \
+            self.ww @ F.transpose(self.p)  # N * N
+        self.L = self.L * \
+            (np.ones((self.N, self.N)) - np.eye(self.N))  # force L[i,i] == 0
+
+        fo = self.L @ self.wr  # N * R
+        ba = F.transpose(self.L) @ self.wr  # N * R
 
         self.cr_list = [0] * self.R
         for i in range(self.R):
-            self.cr_list[i] = C(self.M, F.reshape(self.kr[i, :], (1, self.W)),
-                                F.reshape(self.betar[0, i], (1, 1)))  # N * 1
+            self.cr_list[i] = C(self.M, F.reshape(kr[i, :], (1, self.W)),
+                                F.reshape(betar[0, i], (1, 1)))  # N * 1
         self.cr = F.concat(self.cr_list)  # N * R
 
-        self.bacrfo = F.concat((F.reshape(F.transpose(self.ba), (self.R, self.N, 1)),
+        self.bacrfo = F.concat((F.reshape(F.transpose(ba), (self.R, self.N, 1)),
                                 F.reshape(F.transpose(self.cr),
                                           (self.R, self.N, 1)),
-                                F.reshape(F.transpose(self.fo), (self.R, self.N, 1)),), 2)  # R * N * 3
-        self.pi = F.reshape(self.pi, (self.R, 3, 1))  # R * 3 * 1
+                                F.reshape(F.transpose(fo), (self.R, self.N, 1)),), 2)  # R * N * 3
+        pi = F.reshape(pi, (self.R, 3, 1))  # R * 3 * 1
         self.wr = F.transpose(F.reshape(F.batch_matmul(
-            self.bacrfo, self.pi), (self.R, self.N)))  # N * R
+            self.bacrfo, pi), (self.R, self.N)))  # N * R
 
         self.r = F.reshape(F.matmul(F.transpose(self.M), self.wr),
                            (1, self.R * self.W))  # W * R (-> 1 * RW)
 
-        self.y = self.l_Wr(self.r) + self.nu  # 1 * Y
+        self.y = self.l_Wr(self.r) + nu  # 1 * Y
         return self.y
 
     def reset_state(self):
@@ -226,7 +228,7 @@ if __name__ == '__main__':
             y = mdl(x)
             if (isinstance(t, chainer.Variable)):
                 loss += (y - t)**2
-                print y.data, t.data, np.argmax(y.data) == np.argmax(t.data)
+                print(y.data, t.data, np.argmax(y.data) == np.argmax(t.data))
                 if (np.argmax(y.data) == np.argmax(t.data)):
                     acc += 1
             if (cnt + 1 == seqlen):
@@ -235,7 +237,7 @@ if __name__ == '__main__':
                 loss.backward()
                 opt.update()
                 loss.unchain_backward()
-                print '(', datacnt, ')', loss.data.sum() / loss.data.size / contentlen, acc / contentlen
+                print('(', datacnt, ')', loss.data.sum() / loss.data.size / contentlen, acc / contentlen)
                 lossfrac += [loss.data.sum() / loss.data.size / seqlen, 1.]
                 loss = 0.0
                 acc = 0.0
